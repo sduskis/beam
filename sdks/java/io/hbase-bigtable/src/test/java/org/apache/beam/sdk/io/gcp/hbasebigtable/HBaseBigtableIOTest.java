@@ -1,21 +1,4 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-package org.apache.beam.sdk.io.hbase;
+package org.apache.beam.sdk.io.gcp.hbasebigtable;
 
 import static org.apache.beam.sdk.testing.SourceTestUtils.assertSourcesEqualReferenceSource;
 import static org.apache.beam.sdk.testing.SourceTestUtils.assertSplitAtFractionExhaustive;
@@ -27,12 +10,16 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThat;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.io.BoundedSource;
-import org.apache.beam.sdk.io.hbase.HBaseIO.HBaseSource;
+import org.apache.beam.sdk.io.gcp.hbasebigtable.HBaseBigtableIO.BigtableSource;
+import org.apache.beam.sdk.io.hbase.HBaseMutationCoder;
 import org.apache.beam.sdk.io.range.ByteKey;
 import org.apache.beam.sdk.io.range.ByteKeyRange;
 import org.apache.beam.sdk.testing.PAssert;
@@ -44,30 +31,27 @@ import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.HBaseConfiguration;
-import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HColumnDescriptor;
-import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.MiniHBaseCluster;
 import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.client.Admin;
 import org.apache.hadoop.hbase.client.BufferedMutator;
 import org.apache.hadoop.hbase.client.Connection;
 import org.apache.hadoop.hbase.client.ConnectionFactory;
-import org.apache.hadoop.hbase.client.HBaseAdmin;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.Scan;
-import org.apache.hadoop.hbase.client.Table;
 import org.apache.hadoop.hbase.filter.CompareFilter;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.filter.RegexStringComparator;
 import org.apache.hadoop.hbase.filter.RowFilter;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.hamcrest.Matchers;
+import org.junit.After;
 import org.junit.AfterClass;
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.Test;
@@ -75,153 +59,172 @@ import org.junit.rules.ExpectedException;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
-/** Test HBaseIO. */
+import com.google.cloud.bigtable.hbase.BigtableConfiguration;
+
+/**
+ * HBaseBigtableIOTest integration tests
+ */
 @RunWith(JUnit4.class)
-public class HBaseIOTest {
+public class HBaseBigtableIOTest {
   @Rule public final transient TestPipeline p = TestPipeline.create();
   @Rule public ExpectedException thrown = ExpectedException.none();
-
-  private static HBaseTestingUtility htu;
-  private static HBaseAdmin admin;
-
-  private static final Configuration conf = HBaseConfiguration.create();
-  private static final byte[] COLUMN_FAMILY = Bytes.toBytes("info");
-  private static final byte[] COLUMN_NAME = Bytes.toBytes("name");
+  
+  private static final byte[] COLUMN_FAMILY = Bytes.toBytes("cf");
+  private static final byte[] COLUMN_QUALIFIER = Bytes.toBytes("cq");
   private static final byte[] COLUMN_EMAIL = Bytes.toBytes("email");
+
+  private static String projectId = "sduskis-hello-shakespear";
+  private static String instanceId = "beam-test";
+
+  private static String tableId;
+  private static Connection bigtableConn;
+  private static Admin admin;
 
   @BeforeClass
   public static void beforeClass() throws Exception {
-    conf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 1);
-    // Try to bind the hostname to localhost to solve an issue when it is not configured or
-    // no DNS resolution available.
-    conf.setStrings("hbase.master.hostname", "localhost");
-    conf.setStrings("hbase.regionserver.hostname", "localhost");
-    htu = new HBaseTestingUtility(conf);
-
-    // We don't use the full htu.startMiniCluster() to avoid starting unneeded HDFS/MR daemons
-    htu.startMiniZKCluster();
-    MiniHBaseCluster hbm = htu.startMiniHBaseCluster(1, 4);
-    hbm.waitForActiveAndReadyMaster();
-
-    admin = htu.getHBaseAdmin();
+    Configuration conf = BigtableConfiguration.configure(projectId, instanceId);
+    bigtableConn = ConnectionFactory.createConnection(conf);
+    admin = bigtableConn.getAdmin();
   }
 
   @AfterClass
   public static void afterClass() throws Exception {
-    if (admin != null) {
-      admin.close();
+    if (bigtableConn != null) {
+      bigtableConn.close();
+      bigtableConn = null;
       admin = null;
     }
-    if (htu != null) {
-      htu.shutdownMiniHBaseCluster();
-      htu.shutdownMiniZKCluster();
-      htu = null;
-    }
+  }
+
+  @Before
+  public void setup() throws Exception {
+    tableId = String.format("BigtableIT-%tF-%<tH-%<tM-%<tS-%<tL", new Date());
+  }
+
+  @After
+  public void tearDown() throws Exception {
+    deleteTable(tableId);
   }
 
   @Test
   public void testReadBuildsCorrectly() {
-    HBaseIO.Read read = HBaseIO.read().withConfiguration(conf).withTableId("table");
-    assertEquals("table", read.getTableId().get());
+    HBaseBigtableIO.Read read = HBaseBigtableIO.read().withProjectId(projectId)
+        .withInstanceId(instanceId).withTableId(tableId);
+    assertEquals(tableId, read.getTableId().get());
     assertNotNull("configuration", read.getConfiguration());
+    assertNotNull(projectId, read.getProjectId());
+    assertNotNull(instanceId, read.getInstanceId());
   }
 
   @Test
   public void testReadBuildsCorrectlyInDifferentOrder() {
-    HBaseIO.Read read = HBaseIO.read().withTableId("table").withConfiguration(conf);
-    assertEquals("table", read.getTableId().get());
+    HBaseBigtableIO.Read read = HBaseBigtableIO.read().withTableId(tableId)
+        .withInstanceId(instanceId).withProjectId(projectId);
+    assertEquals(tableId, read.getTableId().get());
     assertNotNull("configuration", read.getConfiguration());
+    assertNotNull(projectId, read.getProjectId());
+    assertNotNull(instanceId, read.getInstanceId());
   }
 
   @Test
   public void testWriteBuildsCorrectly() {
-    HBaseIO.Write write = HBaseIO.write().withConfiguration(conf).withTableId("table");
-    assertEquals("table", write.getTableId().get());
+    HBaseBigtableIO.Write write = HBaseBigtableIO.write().withProjectId(projectId)
+        .withInstanceId(instanceId).withTableId(tableId);
+    assertEquals(tableId, write.getTableId().get());
     assertNotNull("configuration", write.getConfiguration());
+    assertNotNull(projectId, write.getProjectId());
+    assertNotNull(instanceId, write.getInstanceId());
   }
 
   @Test
   public void testWriteBuildsCorrectlyInDifferentOrder() {
-    HBaseIO.Write write = HBaseIO.write().withTableId("table").withConfiguration(conf);
-    assertEquals("table", write.getTableId().get());
+    HBaseBigtableIO.Write write = HBaseBigtableIO.write().withTableId(tableId)
+        .withInstanceId(instanceId).withProjectId(projectId);
+    assertEquals(tableId, write.getTableId().get());
     assertNotNull("configuration", write.getConfiguration());
+    assertNotNull(projectId, write.getProjectId());
+    assertNotNull(instanceId, write.getInstanceId());
   }
 
   @Test
   public void testWriteValidationFailsMissingTable() {
-    HBaseIO.Write write = HBaseIO.write().withConfiguration(conf);
+    HBaseBigtableIO.Write write = HBaseBigtableIO.write().withInstanceId(instanceId).withProjectId(projectId);
     thrown.expect(IllegalArgumentException.class);
     write.expand(null /* input */);
   }
 
   @Test
-  public void testWriteValidationFailsMissingConfiguration() {
-    HBaseIO.Write write = HBaseIO.write().withTableId("table");
+  public void testWriteValidationFailsMissingProject() {
+    HBaseBigtableIO.Write write = HBaseBigtableIO.write().withInstanceId(instanceId).withTableId(tableId);
     thrown.expect(IllegalArgumentException.class);
     write.expand(null /* input */);
   }
 
-  /** Tests that when reading from a non-existent table, the read fails. */
+  @Test
+  public void testWriteValidationFailsMissingInstance() {
+    HBaseBigtableIO.Write write = HBaseBigtableIO.write().withProjectId(projectId).withTableId(tableId);
+    thrown.expect(IllegalArgumentException.class);
+    write.expand(null /* input */);
+  }
+
   @Test
   public void testReadingFailsTableDoesNotExist() throws Exception {
-    final String table = "TEST-TABLE-INVALID";
-    // Exception will be thrown by read.expand() when read is applied.
     thrown.expect(IllegalArgumentException.class);
-    thrown.expectMessage(String.format("Table %s does not exist", table));
-    runReadTest(HBaseIO.read().withConfiguration(conf).withTableId(table), new ArrayList<Result>());
+    thrown.expectMessage(String.format("Table %s does not exist", tableId));
+    runReadTest(HBaseBigtableIO.read().withProjectId(projectId).withInstanceId(instanceId)
+        .withTableId(tableId), new ArrayList<Result>());
   }
 
-  /** Tests that when reading from an empty table, the read succeeds. */
+  //TODO - add test cases for withConfiguration
+  
   @Test
   public void testReadingEmptyTable() throws Exception {
-    final String table = "TEST-EMPTY-TABLE";
-    createTable(table);
-    runReadTest(HBaseIO.read().withConfiguration(conf).withTableId(table), new ArrayList<Result>());
+    createTable(tableId);
+    runReadTest(HBaseBigtableIO.read().withProjectId(projectId).withInstanceId(instanceId)
+        .withTableId(tableId), new ArrayList<Result>());
   }
 
   @Test
   public void testReading() throws Exception {
-    final String table = "TEST-MANY-ROWS-TABLE";
     final int numRows = 1001;
-    createTable(table);
-    writeData(table, numRows);
-    runReadTestLength(HBaseIO.read().withConfiguration(conf).withTableId(table), 1001);
+    createTable(tableId);
+    writeData(tableId, numRows);
+    runReadTestLength(HBaseBigtableIO.read().withProjectId(projectId).withInstanceId(instanceId)
+        .withTableId(tableId), numRows);
   }
 
-  /** Tests reading all rows from a split table. */
   @Test
   public void testReadingWithSplits() throws Exception {
-    final String table = "TEST-MANY-ROWS-SPLITS-TABLE";
     final int numRows = 1500;
     final int numRegions = 4;
     final long bytesPerRow = 100L;
 
     // Set up test table data and sample row keys for size estimation and splitting.
-    createTable(table);
-    writeData(table, numRows);
+    createTable(tableId);
+    writeData(tableId, numRows);
 
-    HBaseIO.Read read = HBaseIO.read().withConfiguration(conf).withTableId(table);
-    HBaseSource source = new HBaseSource(read, null /* estimatedSizeBytes */);
-    List<? extends BoundedSource<Result>> splits =
-        source.split(numRows * bytesPerRow / numRegions, null /* options */);
+    HBaseBigtableIO.Read read = HBaseBigtableIO.read().withProjectId(projectId)
+        .withInstanceId(instanceId).withTableId(tableId);
+    BigtableSource source = new BigtableSource(read, null /* estimatedSizeBytes */);
+    List<? extends BoundedSource<Result>> splits = source.split(numRows * bytesPerRow / numRegions,
+        null /* options */);
 
     // Test num splits and split equality.
     assertThat(splits, hasSize(4));
     assertSourcesEqualReferenceSource(source, splits, null /* options */);
   }
 
-  /** Tests that a {@link HBaseSource} can be read twice, verifying its immutability. */
   @Test
   public void testReadingSourceTwice() throws Exception {
-    final String table = "TEST-READING-TWICE";
     final int numRows = 10;
 
     // Set up test table data and sample row keys for size estimation and splitting.
-    createTable(table);
-    writeData(table, numRows);
+    createTable(tableId);
+    writeData(tableId, numRows);
 
-    HBaseIO.Read read = HBaseIO.read().withConfiguration(conf).withTableId(table);
-    HBaseSource source = new HBaseSource(read, null /* estimatedSizeBytes */);
+    HBaseBigtableIO.Read read = HBaseBigtableIO.read().withProjectId(projectId)
+        .withInstanceId(instanceId).withTableId(tableId);
+    BigtableSource source = new BigtableSource(read, null /* estimatedSizeBytes */);
     assertThat(SourceTestUtils.readFromSource(source, null), hasSize(numRows));
     // second read.
     assertThat(SourceTestUtils.readFromSource(source, null), hasSize(numRows));
@@ -230,16 +233,16 @@ public class HBaseIOTest {
   /** Tests reading all rows using a filter. */
   @Test
   public void testReadingWithFilter() throws Exception {
-    final String table = "TEST-FILTER-TABLE";
     final int numRows = 1001;
 
-    createTable(table);
-    writeData(table, numRows);
+    createTable(tableId);
+    writeData(tableId, numRows);
 
     String regex = ".*17.*";
     Filter filter = new RowFilter(CompareFilter.CompareOp.EQUAL, new RegexStringComparator(regex));
-    HBaseIO.Read read =
-        HBaseIO.read().withConfiguration(conf).withTableId(table).withFilter(filter);
+    HBaseBigtableIO.Read read = HBaseBigtableIO.read().withProjectId(projectId)
+        .withInstanceId(instanceId).withTableId(tableId).withFilter(filter);
+
     runReadTestLength(read, 20);
   }
 
@@ -249,46 +252,47 @@ public class HBaseIOTest {
    */
   @Test
   public void testReadingWithKeyRange() throws Exception {
-    final String table = "TEST-KEY-RANGE-TABLE";
     final int numRows = 1001;
     final byte[] startRow = "2".getBytes();
     final byte[] stopRow = "9".getBytes();
     final ByteKey startKey = ByteKey.copyFrom(startRow);
 
-    createTable(table);
-    writeData(table, numRows);
+    createTable(tableId);
+    writeData(tableId, numRows);
 
     // Test prefix: [beginning, startKey).
     final ByteKeyRange prefixRange = ByteKeyRange.ALL_KEYS.withEndKey(startKey);
     runReadTestLength(
-        HBaseIO.read().withConfiguration(conf).withTableId(table).withKeyRange(prefixRange), 126);
+        HBaseBigtableIO.read().withProjectId(projectId)
+        .withInstanceId(instanceId).withTableId(tableId).withKeyRange(prefixRange), 126);
 
     // Test suffix: [startKey, end).
     final ByteKeyRange suffixRange = ByteKeyRange.ALL_KEYS.withStartKey(startKey);
     runReadTestLength(
-        HBaseIO.read().withConfiguration(conf).withTableId(table).withKeyRange(suffixRange), 875);
+        HBaseBigtableIO.read().withProjectId(projectId)
+        .withInstanceId(instanceId).withTableId(tableId).withKeyRange(suffixRange), 875);
 
     // Test restricted range: [startKey, endKey).
     // This one tests the second signature of .withKeyRange
     runReadTestLength(
-        HBaseIO.read().withConfiguration(conf).withTableId(table).withKeyRange(startRow, stopRow),
+        HBaseBigtableIO.read().withProjectId(projectId)
+        .withInstanceId(instanceId).withTableId(tableId).withKeyRange(startRow, stopRow),
         441);
   }
 
-  /** Tests dynamic work rebalancing exhaustively. */
-  //@Test 
+  /** Tests d/ynamic work rebalancing exhaustively. */
+  //@Test -- takes a long time
   public void testReadingSplitAtFractionExhaustive() throws Exception {
-    final String table = "TEST-FEW-ROWS-SPLIT-EXHAUSTIVE-TABLE";
     final int numRows = 7;
 
-    createTable(table);
-    writeData(table, numRows);
+    createTable(tableId);
+    writeData(tableId, numRows);
 
-    HBaseIO.Read read = HBaseIO.read().withConfiguration(conf).withTableId(table);
-    HBaseSource source =
-        new HBaseSource(read, null /* estimatedSizeBytes */)
-            .withStartKey(ByteKey.of(48))
-            .withEndKey(ByteKey.of(58));
+    HBaseBigtableIO.Read read = HBaseBigtableIO.read().withProjectId(projectId)
+        .withInstanceId(instanceId).withTableId(tableId);
+    BigtableSource source = new BigtableSource(read, null /* estimatedSizeBytes */)
+        .withStartKey(ByteKey.of(48))
+        .withEndKey(ByteKey.of(58));
 
     assertSplitAtFractionExhaustive(source, null);
   }
@@ -296,14 +300,14 @@ public class HBaseIOTest {
   /** Unit tests of splitAtFraction. */
   @Test
   public void testReadingSplitAtFraction() throws Exception {
-    final String table = "TEST-SPLIT-AT-FRACTION";
     final int numRows = 10;
 
-    createTable(table);
-    writeData(table, numRows);
+    createTable(tableId);
+    writeData(tableId, numRows);
 
-    HBaseIO.Read read = HBaseIO.read().withConfiguration(conf).withTableId(table);
-    HBaseSource source = new HBaseSource(read, null /* estimatedSizeBytes */);
+    HBaseBigtableIO.Read read = HBaseBigtableIO.read().withProjectId(projectId)
+        .withInstanceId(instanceId).withTableId(tableId);
+    BigtableSource source = new BigtableSource(read, null /* estimatedSizeBytes */);
 
     // The value k is based on the partitioning schema for the data, in this test case,
     // the partitioning is HEX-based, so we start from 1/16m and the value k will be
@@ -326,72 +330,78 @@ public class HBaseIOTest {
 
   @Test
   public void testReadingDisplayData() {
-    HBaseIO.Read read = HBaseIO.read().withConfiguration(conf).withTableId("fooTable");
+    HBaseBigtableIO.Read read = HBaseBigtableIO.read().withProjectId(projectId)
+        .withInstanceId(instanceId).withTableId(tableId);
     DisplayData displayData = DisplayData.from(read);
-    assertThat(displayData, hasDisplayItem("tableId", "fooTable"));
+    assertThat(displayData, hasDisplayItem("tableId", tableId));
     assertThat(displayData, hasDisplayItem("configuration"));
+    assertThat(displayData, hasDisplayItem("projectId", projectId));
+    assertThat(displayData, hasDisplayItem("instanceId", instanceId));
   }
 
-  /** Tests that a record gets written to the service and messages are logged. */
   @Test
   public void testWriting() throws Exception {
-    final String table = "table";
     final String key = "key";
     final String value = "value";
     final int numMutations = 100;
 
-    createTable(table);
+    createTable(tableId);
 
-    p.apply("multiple rows", Create.of(makeMutations(key, value, numMutations)))
-        .apply("write", HBaseIO.write().withConfiguration(conf).withTableId(table));
+    p.apply("multiple rows", Create.of(makeMutations(key, value, numMutations))).apply("write",
+        HBaseBigtableIO.write().withProjectId(projectId).withInstanceId(instanceId)
+            .withTableId(tableId));
     p.run().waitUntilFinish();
 
-    List<Result> results = readTable(table, new Scan());
+    List<Result> results = readTable(tableId, new Scan());
     assertEquals(numMutations, results.size());
   }
 
-  /** Tests that when writing to a non-existent table, the write fails. */
   @Test
   public void testWritingFailsTableDoesNotExist() throws Exception {
-    final String table = "TEST-TABLE-DOES-NOT-EXIST";
-
     // Exception will be thrown by write.expand() when writeToDynamic is applied.
     thrown.expect(IllegalArgumentException.class);
-    thrown.expectMessage(String.format("Table %s does not exist", table));
+    thrown.expectMessage(String.format("Table %s does not exist", tableId));
     p.apply(Create.empty(HBaseMutationCoder.of()))
-        .apply("write", HBaseIO.write().withConfiguration(conf).withTableId(table));
+        .apply("write", HBaseBigtableIO.write().withProjectId(projectId).withInstanceId(instanceId)
+            .withTableId(tableId));
   }
 
   /** Tests that when writing an element fails, the write fails. */
   @Test
   public void testWritingFailsBadElement() throws Exception {
-    final String table = "TEST-TABLE-BAD-ELEMENT";
     final String key = "KEY";
-    createTable(table);
+    createTable(tableId);
 
     p.apply(Create.of(makeBadMutation(key)))
-        .apply(HBaseIO.write().withConfiguration(conf).withTableId(table));
+        .apply(HBaseBigtableIO.write().withProjectId(projectId).withInstanceId(instanceId)
+            .withTableId(tableId));
 
     thrown.expect(Pipeline.PipelineExecutionException.class);
     thrown.expectCause(Matchers.<Throwable>instanceOf(IllegalArgumentException.class));
     thrown.expectMessage("No columns to insert");
     p.run().waitUntilFinish();
+    
+    //TODO - fix test case
+    // fails with org.apache.hadoop.hbase.client.RetriesExhaustedWithDetailsException instead of PipelineExecutionException
   }
 
   @Test
   public void testWritingDisplayData() {
-    HBaseIO.Write write = HBaseIO.write().withTableId("fooTable").withConfiguration(conf);
+    HBaseBigtableIO.Write write = HBaseBigtableIO.write().withProjectId(projectId).withInstanceId(instanceId)
+        .withTableId(tableId);
     DisplayData displayData = DisplayData.from(write);
-    assertThat(displayData, hasDisplayItem("tableId", "fooTable"));
+    assertThat(displayData, hasDisplayItem("tableId", tableId));
+    assertThat(displayData, hasDisplayItem("projectId", projectId));
+    assertThat(displayData, hasDisplayItem("instanceId", instanceId));
   }
 
-  // HBase helper methods
-  private static void createTable(String tableId) throws Exception {
-    byte[][] splitKeys = {"4".getBytes(), "8".getBytes(), "C".getBytes()};
+  /** Helper methods **/
+  private void createTable(String tableId) throws Exception {
+    byte[][] splitKeys = { "4".getBytes(), "8".getBytes(), "C".getBytes() };
     createTable(tableId, COLUMN_FAMILY, splitKeys);
   }
 
-  private static void createTable(String tableId, byte[] columnFamily, byte[][] splitKeys)
+  private void createTable(String tableId, byte[] columnFamily, byte[][] splitKeys)
       throws Exception {
     TableName tableName = TableName.valueOf(tableId);
     HTableDescriptor desc = new HTableDescriptor(tableName);
@@ -400,8 +410,15 @@ public class HBaseIOTest {
     admin.createTable(desc, splitKeys);
   }
 
-  /** Helper function to create a table and return the rows that it created. */
-  private static void writeData(String tableId, int numRows) throws Exception {
+  private void deleteTable(String tableId) throws IOException {
+    TableName tableName = TableName.valueOf(tableId);
+    if (admin.tableExists(tableName)) {
+      admin.disableTable(tableName);
+      admin.deleteTable(tableName);
+    }
+  }
+
+  private void writeData(String tableId, int numRows) throws Exception {
     Connection connection = admin.getConnection();
     TableName tableName = TableName.valueOf(tableId);
     BufferedMutator mutator = connection.getBufferedMutator(tableName);
@@ -420,21 +437,32 @@ public class HBaseIOTest {
       byte[] rowKey = Bytes.toBytes(StringUtils.leftPad("_" + String.valueOf(i), 21, prefix));
       byte[] value = Bytes.toBytes(String.valueOf(i));
       byte[] valueEmail = Bytes.toBytes(String.valueOf(i) + "@email.com");
-      mutations.add(new Put(rowKey).addColumn(COLUMN_FAMILY, COLUMN_NAME, value));
+      mutations.add(new Put(rowKey).addColumn(COLUMN_FAMILY, COLUMN_QUALIFIER, value));
       mutations.add(new Put(rowKey).addColumn(COLUMN_FAMILY, COLUMN_EMAIL, valueEmail));
     }
     return mutations;
   }
 
-  private static ResultScanner scanTable(String tableId, Scan scan) throws Exception {
-    Connection connection = ConnectionFactory.createConnection(conf);
-    TableName tableName = TableName.valueOf(tableId);
-    Table table = connection.getTable(tableName);
-    return table.getScanner(scan);
+  private Iterable<Mutation> makeMutations(String key, String value, int numMutations) {
+    List<Mutation> mutations = new ArrayList<>();
+    for (int i = 0; i < numMutations; i++) {
+      mutations.add(makeMutation(key + i, value));
+    }
+    return mutations;
   }
 
-  private static List<Result> readTable(String tableId, Scan scan) throws Exception {
-    ResultScanner scanner = scanTable(tableId, scan);
+  private Mutation makeMutation(String key, String value) {
+    return new Put(key.getBytes(StandardCharsets.UTF_8))
+        .addColumn(COLUMN_FAMILY, COLUMN_QUALIFIER, Bytes.toBytes(value))
+        .addColumn(COLUMN_FAMILY, COLUMN_EMAIL, Bytes.toBytes(value + "@email.com"));
+  }
+
+  private static Mutation makeBadMutation(String key) {
+    return new Put(key.getBytes());
+  }
+
+  private List<Result> readTable(String tableId, Scan scan) throws Exception {
+    ResultScanner scanner = bigtableConn.getTable(TableName.valueOf(tableId)).getScanner(scan);
     List<Result> results = new ArrayList<>();
     for (Result result : scanner) {
       results.add(result);
@@ -443,34 +471,14 @@ public class HBaseIOTest {
     return results;
   }
 
-  // Beam helper methods
-  /** Helper function to make a single row mutation to be written. */
-  private static Iterable<Mutation> makeMutations(String key, String value, int numMutations) {
-    List<Mutation> mutations = new ArrayList<>();
-    for (int i = 0; i < numMutations; i++) {
-      mutations.add(makeMutation(key + i, value));
-    }
-    return mutations;
-  }
-
-  private static Mutation makeMutation(String key, String value) {
-    return new Put(key.getBytes(StandardCharsets.UTF_8))
-        .addColumn(COLUMN_FAMILY, COLUMN_NAME, Bytes.toBytes(value))
-        .addColumn(COLUMN_FAMILY, COLUMN_EMAIL, Bytes.toBytes(value + "@email.com"));
-  }
-
-  private static Mutation makeBadMutation(String key) {
-    return new Put(key.getBytes());
-  }
-
-  private void runReadTest(HBaseIO.Read read, List<Result> expected) {
+  private void runReadTest(HBaseBigtableIO.Read read, List<Result> expected) {
     final String transformId = read.getTableId().get() + "_" + read.getKeyRange();
     PCollection<Result> rows = p.apply("Read" + transformId, read);
     PAssert.that(rows).containsInAnyOrder(expected);
     p.run().waitUntilFinish();
   }
 
-  private void runReadTestLength(HBaseIO.Read read, long numElements) {
+  private void runReadTestLength(HBaseBigtableIO.Read read, long numElements) {
     final String transformId = read.getTableId().get() + "_" + read.getKeyRange();
     PCollection<Result> rows = p.apply("Read" + transformId, read);
     PAssert.thatSingleton(rows.apply("Count" + transformId, Count.<Result>globally()))
